@@ -75,10 +75,11 @@
 
     <div class="card">
       <h2>Livelli sulla mappa</h2>
-      <div class="toggle-row"><span>Confine regione Sardegna (ISTAT)</span><input type="checkbox" id="toggleComuni" checked /></div>
+      <div class="toggle-row"><span>Confine regione Sardegna (ISTAT)</span><input type="checkbox" id="toggleRegione" checked /></div>
+      <div class="toggle-row"><span>Confini dei 377 Comuni (ISTAT)</span><input type="checkbox" id="toggleComuni" /></div>
       <div class="toggle-row"><span>Hotspot FIRMS (24-48h)</span><input type="checkbox" id="toggleFires" checked /></div>
       <div class="toggle-row"><span>Storico caricato</span><input type="checkbox" id="toggleHistory" checked /></div>
-      <p style="margin-top:4px;">Confine geografico reale della Sardegna (fonte dati ISTAT). Il dettaglio dei singoli confini comunali si può aggiungere in un secondo momento, quando servirà distinguere Comune per Comune.</p>
+      <p style="margin-top:4px;">Ogni hotspot (live o storico) è associato automaticamente al Comune sardo di appartenenza — visibile nel popup cliccando sul punto. Il layer dei confini comunali è spento di default per non appesantire la mappa: attivalo per vederli disegnati.</p>
     </div>
 
     <div class="card">
@@ -92,8 +93,8 @@
 
     <div class="card">
       <h2>Cosa fa questo prototipo</h2>
-      <p>Interroga in tempo reale l'API pubblica NASA FIRMS per la Sardegna e mostra i punti caldi rilevati da satellite, più uno storico accumulato nel tempo. È il primo mattone della piattaforma software (Fase 1 del piano): zero hardware, solo integrazione di dati esistenti.</p>
-      <p><strong>Prossimi passi tecnici</strong>: alert automatici via email/Telegram, confini comunali (non solo regionali), layer EFFIS come seconda fonte satellitare, deploy online con link pubblico.</p>
+      <p>Interroga in tempo reale l'API pubblica NASA FIRMS per la Sardegna e mostra i punti caldi rilevati da satellite, più uno storico accumulato nel tempo. Ogni rilevamento viene associato al Comune di appartenenza e, se nuovo e non filtrato come falso allarme, genera un alert automatico via Telegram e/o email. È il primo mattone della piattaforma software (Fase 1 del piano): zero hardware, solo integrazione di dati esistenti.</p>
+      <p><strong>Prossimi passi tecnici</strong>: layer EFFIS come seconda fonte satellitare, dashboard di riepilogo per Comune, integrazione con i canali ufficiali di allerta della Protezione Civile.</p>
     </div>
   </aside>
 </div>
@@ -104,6 +105,7 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="sardegna_geo.js"></script>
+<script src="sardegna_comuni.js"></script>
 <script>
   // Sardinia bounding box (west, south, east, north)
   const SARDINIA_BBOX = { west: 8.05, south: 38.80, east: 9.90, north: 41.35 };
@@ -117,14 +119,59 @@
 
   // Confine reale della Regione Sardegna (fonte: openpolis/geojson-italy, derivato da ISTAT,
   // geometria semplificata per alleggerire il file — vedi sardegna_geo.js)
-  const comuniLayer = L.geoJSON(SARDINIA_GEOJSON, {
+  const regioneLayer = L.geoJSON(SARDINIA_GEOJSON, {
     style: { color: '#1b2a41', weight: 1.5, fillOpacity: 0.03 }
   }).addTo(map);
-  comuniLayer.bindPopup('Confine regionale Sardegna (ISTAT, semplificato). I confini dei singoli Comuni si possono aggiungere allo stesso modo quando servirà il dettaglio comunale.');
+  regioneLayer.bindPopup('Confine regionale Sardegna (ISTAT, semplificato).');
 
+  document.getElementById('toggleRegione').addEventListener('change', (e) => {
+    if (e.target.checked) regioneLayer.addTo(map); else map.removeLayer(regioneLayer);
+  });
+
+  // Confini dei singoli Comuni (spenti di default, si attivano dal pannello):
+  // stesso procedimento del confine regionale, ma un layer per ognuno dei 377
+  // Comuni sardi, con popup che mostra il nome al click.
+  const comuniLayer = L.geoJSON(SARDEGNA_COMUNI_GEOJSON, {
+    style: { color: '#6b7789', weight: 1, fillOpacity: 0.02 },
+    onEachFeature: (feature, layer) => {
+      const p = feature.properties || {};
+      layer.bindPopup(`<strong>${p.comune || 'n/d'}</strong><br>Provincia: ${p.provincia || 'n/d'}`);
+    }
+  });
   document.getElementById('toggleComuni').addEventListener('change', (e) => {
     if (e.target.checked) comuniLayer.addTo(map); else map.removeLayer(comuniLayer);
   });
+
+  // Trova il Comune sardo a cui appartiene un punto (point-in-polygon, ray
+  // casting). Usato per i dati LIVE (lo storico ha già il campo "comune"
+  // calcolato da fetch_firms.py, più preciso perché include il fallback sul
+  // Comune più vicino per i punti in mare).
+  function pointInRing(lon, lat, ring) {
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const xi = ring[i][0], yi = ring[i][1];
+      const xj = ring[j][0], yj = ring[j][1];
+      const intersect = ((yi > lat) !== (yj > lat)) &&
+        (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+  function pointInGeometry(lon, lat, geometry) {
+    if (geometry.type === 'Polygon') {
+      return pointInRing(lon, lat, geometry.coordinates[0]);
+    }
+    if (geometry.type === 'MultiPolygon') {
+      return geometry.coordinates.some(poly => pointInRing(lon, lat, poly[0]));
+    }
+    return false;
+  }
+  function findComune(lat, lon) {
+    for (const feat of SARDEGNA_COMUNI_GEOJSON.features) {
+      if (pointInGeometry(lon, lat, feat.geometry)) return feat.properties.comune;
+    }
+    return null;
+  }
 
   let fireLayer = L.layerGroup().addTo(map);
   document.getElementById('toggleFires').addEventListener('change', (e) => {
@@ -237,8 +284,11 @@
       const marker = L.circleMarker([lat, lon], {
         radius: isSuspect ? 4 : 5, color, fillColor: color, fillOpacity: isSuspect ? 0.45 : 0.7, weight: 1
       });
+      const comune = p.comune ? p.comune.replace(/^~/, '') : null;
+      const comuneLabel = comune ? (p.comune.startsWith('~') ? `${comune} (comune più vicino, punto non ricadente in nessun confine)` : comune) : 'non determinato';
       marker.bindPopup(
         `<strong>Hotspot storico${isSuspect ? ' — sospetto' : ''}</strong><br>` +
+        `Comune: ${comuneLabel}<br>` +
         `Data/ora (UTC): ${p.acq_date || 'n/d'} ${p.acq_time || ''}<br>` +
         `Confidenza: ${p.confidence || 'n/d'} · FRP: ${p.frp ?? 'n/d'} MW` +
         (isSuspect ? `<br><em>${reasons.join(' · ')}</em>` : '')
@@ -352,8 +402,10 @@
         const marker = L.circleMarker([lat, lon], {
           radius: isSuspect ? 5 : 6, color, fillColor: color, fillOpacity: isSuspect ? 0.5 : 0.75, weight: 1
         });
+        const comune = findComune(lat, lon) || 'non determinato';
         marker.bindPopup(
           `<strong>Hotspot satellitare${isSuspect ? ' — sospetto' : ''}</strong><br>` +
+          `Comune: ${comune}<br>` +
           `Data/ora (UTC): ${acqDate} ${acqTime}<br>` +
           `Confidenza: ${cols[confIdx] || 'n/d'}<br>` +
           `Coordinate: ${lat.toFixed(3)}, ${lon.toFixed(3)}` +
