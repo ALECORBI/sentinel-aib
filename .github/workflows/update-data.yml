@@ -1,0 +1,28 @@
+name: Aggiorna storico incendi (FIRMS)
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Esegui fetch_firms.py
+        env:
+          FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
+        run: python3 fetch_firms.py
+
+      - name: Salva i dati aggiornati nel repository
+        run: |
+          git config user.name "sentinel-aib-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/history.json data/history_summary.json data/sentinel_aib.db
+          git diff --cached --quiet || git commit -m "Aggiorna storico hotspot (automatico)"
+          git push
