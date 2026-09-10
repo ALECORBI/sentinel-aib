@@ -1,9 +1,21 @@
 name: Aggiorna storico incendi (FIRMS)
 
+# Esegue fetch_firms.py ogni 3 ore, aggiorna data/history.json e lo
+# ricommitta nel repository. GitHub Pages ripubblica automaticamente il
+# sito con i dati aggiornati, senza bisogno di intervento manuale.
+#
+# Richiede un GitHub Secret chiamato FIRMS_MAP_KEY con la tua chiave
+# NASA FIRMS (Settings del repo -> Secrets and variables -> Actions ->
+# New repository secret). Vedi README.md per le istruzioni passo passo.
+#
+# Gli alert automatici (Telegram/email) sono opzionali: se non configuri i
+# relativi secrets, lo script li salta semplicemente senza errori. Vedi
+# README.md per come creare un bot Telegram e/o una app password Gmail.
+
 on:
   schedule:
-    - cron: "0 */3 * * *"
-  workflow_dispatch:
+    - cron: "0 */3 * * *"   # ogni 3 ore
+  workflow_dispatch:          # permette anche di lanciarlo a mano dalla tab "Actions" su GitHub
 
 permissions:
   contents: write
@@ -14,9 +26,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Installa le dipendenze (shapely, per il calcolo del Comune)
+        run: pip install --quiet shapely
+
       - name: Esegui fetch_firms.py
         env:
           FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
         run: python3 fetch_firms.py
 
       - name: Salva i dati aggiornati nel repository
