@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sentinel AIB — Dashboard Rischio Incendi (Sardegna)</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<style>
+  :root{
+    --navy:#1b2a41; --ember:#c1440e; --gold:#b8860b; --grey:#555;
+    --bg:#f4f3ef; --panel:#ffffff; --border:#e1ddd3; --text:#1c1c1c;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);}
+  header{background:var(--navy);color:#fff;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;}
+  header h1{font-size:18px;margin:0;font-weight:700;}
+  header .tag{font-size:12px;color:#cbd3df;font-weight:400;}
+  .layout{display:flex;height:calc(100vh - 58px);min-height:520px;}
+  #map{flex:1;min-width:0;}
+  aside{width:320px;max-width:38vw;background:var(--panel);border-left:1px solid var(--border);padding:16px;overflow-y:auto;}
+  @media (max-width:720px){
+    .layout{flex-direction:column;height:auto;}
+    #map{height:60vh;}
+    aside{width:auto;max-width:none;border-left:none;border-top:1px solid var(--border);}
+  }
+  .card{border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin-bottom:14px;background:#fff;}
+  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--ember);margin:0 0 8px;}
+  .card p, .card label{font-size:13px;color:var(--grey);line-height:1.5;margin:0 0 8px;}
+  input[type=text]{width:100%;padding:7px 8px;border:1px solid var(--border);border-radius:6px;font-size:13px;}
+  button{background:var(--ember);color:#fff;border:none;padding:8px 12px;border-radius:6px;font-size:13px;cursor:pointer;width:100%;}
+  button:hover{opacity:.92;}
+  button.secondary{background:var(--navy);}
+  .status{font-size:12px;padding:6px 8px;border-radius:6px;margin-top:8px;}
+  .status.ok{background:#e7f3e8;color:#2a6b32;}
+  .status.warn{background:#fbeee6;color:#8a3b12;}
+  .status.idle{background:#eee;color:#666;}
+  .legend-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--grey);margin-bottom:6px;}
+  .dot{width:10px;height:10px;border-radius:50%;flex:none;}
+  .toggle-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;}
+  .toggle-row span{font-size:13px;}
+  .badge{display:inline-block;font-size:11px;padding:2px 7px;border-radius:20px;background:var(--gold);color:#fff;margin-left:6px;}
+  a{color:var(--ember);}
+  footer{font-size:11px;color:#888;padding:8px 20px;background:var(--panel);border-top:1px solid var(--border);}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Sentinel AIB — Dashboard Rischio Incendi</h1>
+    <div class="tag">Prototipo Fase 1 · dati satellitari pubblici · area: Sardegna</div>
+  </div>
+  <div class="tag">Ultimo aggiornamento: <span id="lastUpdate">—</span></div>
+</header>
+
+<div class="layout">
+  <div id="map"></div>
+  <aside>
+    <div class="card">
+      <h2>Hotspot NASA FIRMS <span class="badge">satellite</span></h2>
+      <p>Rilevamenti termici (MODIS/VIIRS) delle ultime 24-48h. Serve una MAP_KEY gratuita di NASA FIRMS: <a href="https://firms.modaps.eosdis.nasa.gov/api/map_key/" target="_blank" rel="noopener">richiedila qui</a> (istantanea, via email).</p>
+      <label for="mapKey">La tua MAP_KEY</label>
+      <input type="text" id="mapKey" placeholder="incolla qui la chiave" />
+      <button id="loadFires">Carica hotspot su mappa</button>
+      <div id="firmsStatus" class="status idle">Nessuna chiave inserita — mappa vuota per gli hotspot.</div>
+    </div>
+
+    <div class="card">
+      <h2>Storico rilevamenti <span class="badge">nuovo</span></h2>
+      <p>Genera lo storico eseguendo <code>fetch_firms.py</code> (vedi README), poi carica qui il file <code>data/history.json</code> che produce, per vedere tutti i rilevamenti accumulati nel tempo — non solo le ultime 24-48h.</p>
+      <label for="historyFile">File storico (history.json)</label>
+      <input type="file" id="historyFile" accept="application/json" />
+      <div id="historyStatus" class="status idle">Nessuno storico caricato.</div>
+    </div>
+
+    <div class="card">
+      <h2>Livelli sulla mappa</h2>
+      <div class="toggle-row"><span>Confine regione Sardegna (ISTAT)</span><input type="checkbox" id="toggleComuni" checked /></div>
+      <div class="toggle-row"><span>Hotspot FIRMS (24-48h)</span><input type="checkbox" id="toggleFires" checked /></div>
+      <div class="toggle-row"><span>Storico caricato</span><input type="checkbox" id="toggleHistory" checked /></div>
+      <p style="margin-top:4px;">Confine geografico reale della Sardegna (fonte dati ISTAT). Il dettaglio dei singoli confini comunali si può aggiungere in un secondo momento, quando servirà distinguere Comune per Comune.</p>
+    </div>
+
+    <div class="card">
+      <h2>Legenda</h2>
+      <div class="legend-row"><span class="dot" style="background:#c1440e;"></span> Hotspot rilevato nelle ultime 24h</div>
+      <div class="legend-row"><span class="dot" style="background:#f0a45a;"></span> Hotspot 24-48h fa</div>
+      <div class="legend-row"><span class="dot" style="background:#2d5f7c;"></span> Hotspot storico (probabile reale)</div>
+      <div class="legend-row"><span class="dot" style="background:#b7b7b7;"></span> Sospetto (alba/tramonto, fonte ricorrente o sito industriale)</div>
+      <div class="legend-row"><span class="dot" style="background:#1b2a41;"></span> Confine regionale</div>
+    </div>
+
+    <div class="card">
+      <h2>Cosa fa questo prototipo</h2>
+      <p>Interroga in tempo reale l'API pubblica NASA FIRMS per la Sardegna e mostra i punti caldi rilevati da satellite, più uno storico accumulato nel tempo. È il primo mattone della piattaforma software (Fase 1 del piano): zero hardware, solo integrazione di dati esistenti.</p>
+      <p><strong>Prossimi passi tecnici</strong>: alert automatici via email/Telegram, confini comunali (non solo regionali), layer EFFIS come seconda fonte satellitare, deploy online con link pubblico.</p>
+    </div>
+  </aside>
+</div>
+
+<footer>
+  Dati: NASA FIRMS (MODIS/VIIRS, near real-time). Prototipo dimostrativo — non usare per decisioni operative reali senza validazione. · Sentinel AIB
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="sardegna_geo.js"></script>
+<script>
+  // Sardinia bounding box (west, south, east, north)
+  const SARDINIA_BBOX = { west: 8.05, south: 38.80, east: 9.90, north: 41.35 };
+  const SARDINIA_CENTER = [40.1, 9.0];
+
+  const map = L.map('map', { zoomControl: true }).setView(SARDINIA_CENTER, 8);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  // Confine reale della Regione Sardegna (fonte: openpolis/geojson-italy, derivato da ISTAT,
+  // geometria semplificata per alleggerire il file — vedi sardegna_geo.js)
+  const comuniLayer = L.geoJSON(SARDINIA_GEOJSON, {
+    style: { color: '#1b2a41', weight: 1.5, fillOpacity: 0.03 }
+  }).addTo(map);
+  comuniLayer.bindPopup('Confine regionale Sardegna (ISTAT, semplificato). I confini dei singoli Comuni si possono aggiungere allo stesso modo quando servirà il dettaglio comunale.');
+
+  document.getElementById('toggleComuni').addEventListener('change', (e) => {
+    if (e.target.checked) comuniLayer.addTo(map); else map.removeLayer(comuniLayer);
+  });
+
+  let fireLayer = L.layerGroup().addTo(map);
+  document.getElementById('toggleFires').addEventListener('change', (e) => {
+    if (e.target.checked) fireLayer.addTo(map); else map.removeLayer(fireLayer);
+  });
+
+  // --- Storico (caricato da data/history.json, generato da fetch_firms.py) ---
+  let historyLayer = L.layerGroup().addTo(map);
+  document.getElementById('toggleHistory').addEventListener('change', (e) => {
+    if (e.target.checked) historyLayer.addTo(map); else map.removeLayer(historyLayer);
+  });
+
+  // ==========================================================================
+  // Filtri anti-falso-allarme (stessa logica di fetch_firms.py, portata in JS
+  // per applicarli anche ai dati caricati in tempo reale, non solo allo storico)
+  // ==========================================================================
+  const TWILIGHT_WINDOW_MINUTES = 40;
+  const KNOWN_INDUSTRIAL_SITES = [
+    { name: 'Polo industriale Sarroch (raffineria Saras)', lat: 39.0730, lon: 9.0150, radiusKm: 3.0 },
+    { name: 'Polo industriale Portovesme / Portoscuso', lat: 39.1940, lon: 8.3930, radiusKm: 3.0 },
+    { name: 'Area industriale di Ottana', lat: 40.2710, lon: 9.0000, radiusKm: 2.5 },
+    { name: 'Polo petrolchimico di Porto Torres', lat: 40.8460, lon: 8.4040, radiusKm: 3.0 },
+    { name: 'Area industriale di Assemini/Macchiareddu', lat: 39.2830, lon: 9.0000, radiusKm: 3.0 },
+  ];
+
+  // Alba/tramonto in ore UTC decimali, formula astronomica NOAA (stessa di fetch_firms.py)
+  function sunriseSunsetUtcHours(lat, lon, dateObj) {
+    const start = Date.UTC(dateObj.getUTCFullYear(), 0, 0);
+    const n = Math.floor((dateObj - start) / 86400000);
+    const latRad = lat * Math.PI / 180;
+    const gamma = 2 * Math.PI / 365 * (n - 1);
+
+    const eqtime = 229.18 * (
+      0.000075 + 0.001868 * Math.cos(gamma) - 0.032077 * Math.sin(gamma)
+      - 0.014615 * Math.cos(2 * gamma) - 0.040849 * Math.sin(2 * gamma)
+    );
+    const decl = (
+      0.006918 - 0.399912 * Math.cos(gamma) + 0.070257 * Math.sin(gamma)
+      - 0.006758 * Math.cos(2 * gamma) + 0.000907 * Math.sin(2 * gamma)
+      - 0.002697 * Math.cos(3 * gamma) + 0.00148 * Math.sin(3 * gamma)
+    );
+
+    const zenith = 90.833 * Math.PI / 180;
+    let cosH = (Math.cos(zenith) / (Math.cos(latRad) * Math.cos(decl))
+                - Math.tan(latRad) * Math.tan(decl));
+    cosH = Math.max(-1, Math.min(1, cosH));
+    const ha = Math.acos(cosH) * 180 / Math.PI;
+
+    const solarNoonMin = 720 - 4 * lon - eqtime;
+    return [(solarNoonMin - 4 * ha) / 60, (solarNoonMin + 4 * ha) / 60];
+  }
+
+  function isTwilightSuspect(lat, lon, acqDateStr, acqTimeStr) {
+    const [y, m, d] = acqDateStr.split('-').map(Number);
+    if (!y || !m || !d) return false;
+    const dateObj = new Date(Date.UTC(y, m - 1, d));
+    const hhmm = acqTimeStr.padStart(4, '0');
+    const tHours = parseInt(hhmm.slice(0, 2), 10) + parseInt(hhmm.slice(2, 4), 10) / 60;
+    const [sunrise, sunset] = sunriseSunsetUtcHours(lat, lon, dateObj);
+    const window = TWILIGHT_WINDOW_MINUTES / 60;
+    return Math.abs(tHours - sunrise) <= window || Math.abs(tHours - sunset) <= window;
+  }
+
+  function haversineKm(lat1, lon1, lat2, lon2) {
+    const r = 6371;
+    const p1 = lat1 * Math.PI / 180, p2 = lat2 * Math.PI / 180;
+    const dphi = (lat2 - lat1) * Math.PI / 180;
+    const dlambda = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dphi / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dlambda / 2) ** 2;
+    return 2 * r * Math.asin(Math.sqrt(a));
+  }
+
+  function nearbyIndustrialSite(lat, lon) {
+    for (const site of KNOWN_INDUSTRIAL_SITES) {
+      if (haversineKm(lat, lon, site.lat, site.lon) <= site.radiusKm) return site.name;
+    }
+    return null;
+  }
+
+  function setHistoryStatus(msg, kind) {
+    const el = document.getElementById('historyStatus');
+    el.textContent = msg;
+    el.className = 'status ' + kind;
+  }
+
+  function renderHistory(data) {
+    historyLayer.clearLayers();
+    const points = Array.isArray(data.hotspots) ? data.hotspots : [];
+    let plotted = 0, suspectCount = 0;
+    points.forEach(p => {
+      const lat = parseFloat(p.latitude), lon = parseFloat(p.longitude);
+      if (isNaN(lat) || isNaN(lon)) return;
+
+      // I flag arrivano già calcolati da fetch_firms.py; se il file è più vecchio
+      // e non li contiene ancora, li calcoliamo qui al volo come ripiego.
+      const twilight = 'is_twilight_suspect' in p ? !!p.is_twilight_suspect
+        : isTwilightSuspect(lat, lon, p.acq_date, p.acq_time || '0000');
+      const industrial = 'near_industrial_site' in p ? p.near_industrial_site
+        : nearbyIndustrialSite(lat, lon);
+      const recurring = !!p.is_recurring_source;
+
+      const reasons = [];
+      if (twilight) reasons.push('vicino ad alba/tramonto (possibile riflesso)');
+      if (industrial) reasons.push(`vicino a sito industriale noto: ${industrial}`);
+      if (recurring) reasons.push(`fonte ricorrente (${p.recurring_days_count || '≥3'} giorni diversi)`);
+      const isSuspect = reasons.length > 0;
+      if (isSuspect) suspectCount++;
+
+      const color = isSuspect ? '#b7b7b7' : '#2d5f7c';
+      const marker = L.circleMarker([lat, lon], {
+        radius: isSuspect ? 4 : 5, color, fillColor: color, fillOpacity: isSuspect ? 0.45 : 0.7, weight: 1
+      });
+      marker.bindPopup(
+        `<strong>Hotspot storico${isSuspect ? ' — sospetto' : ''}</strong><br>` +
+        `Data/ora (UTC): ${p.acq_date || 'n/d'} ${p.acq_time || ''}<br>` +
+        `Confidenza: ${p.confidence || 'n/d'} · FRP: ${p.frp ?? 'n/d'} MW` +
+        (isSuspect ? `<br><em>${reasons.join(' · ')}</em>` : '')
+      );
+      marker.addTo(historyLayer);
+      plotted++;
+    });
+    const dates = points.map(p => p.acq_date).filter(Boolean).sort();
+    const range = dates.length ? ` (dal ${dates[0]} al ${dates[dates.length - 1]})` : '';
+    setHistoryStatus(
+      plotted > 0
+        ? `${plotted} rilevamenti storici caricati${range} — ${suspectCount} marcati come sospetti.`
+        : 'File letto ma nessun rilevamento trovato.',
+      plotted > 0 ? 'ok' : 'warn'
+    );
+  }
+
+  document.getElementById('historyFile').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setHistoryStatus('Lettura del file in corso…', 'idle');
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        renderHistory(data);
+      } catch (err) {
+        setHistoryStatus('File non valido o non leggibile: ' + err.message, 'warn');
+      }
+    };
+    reader.onerror = () => setHistoryStatus('Errore nella lettura del file.', 'warn');
+    reader.readAsText(file);
+  });
+
+  // Quando il sito è online (non aperto come file locale), prova a caricare
+  // automaticamente data/history.json, se presente accanto a questa pagina.
+  // Se non c'è (o siamo in locale via file://) fallisce in silenzio: si può
+  // sempre caricare a mano col selettore qui sopra.
+  if (location.protocol !== 'file:') {
+    fetch('data/history.json')
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then(renderHistory)
+      .catch(() => { /* nessuno storico pubblicato ancora: va bene, si carica a mano */ });
+  }
+
+  // Chiave di default (fornita dall'utente) — resta comunque modificabile e salvata in locale
+  const DEFAULT_MAP_KEY = 'ee8b25afca13775a8b35c6db07786c93';
+  const savedKey = localStorage.getItem('firms_map_key') || DEFAULT_MAP_KEY;
+  if (savedKey) document.getElementById('mapKey').value = savedKey;
+
+  function setStatus(msg, kind) {
+    const el = document.getElementById('firmsStatus');
+    el.textContent = msg;
+    el.className = 'status ' + kind;
+  }
+
+  function hoursAgo(dateStr, timeStr) {
+    // dateStr YYYY-MM-DD, timeStr HHMM (UTC)
+    const iso = `${dateStr}T${timeStr.padStart(4,'0').slice(0,2)}:${timeStr.padStart(4,'0').slice(2,4)}:00Z`;
+    const t = new Date(iso).getTime();
+    return (Date.now() - t) / 3600000;
+  }
+
+  async function loadFires() {
+    const key = document.getElementById('mapKey').value.trim();
+    if (!key) { setStatus('Inserisci prima una MAP_KEY valida.', 'warn'); return; }
+    localStorage.setItem('firms_map_key', key);
+    setStatus('Richiesta dati a NASA FIRMS in corso…', 'idle');
+
+    const area = `${SARDINIA_BBOX.west},${SARDINIA_BBOX.south},${SARDINIA_BBOX.east},${SARDINIA_BBOX.north}`;
+    const url = `https://firms.modaps.eosdis.nasa.gov/api/area/csv/${key}/VIIRS_SNPP_NRT/${area}/2`;
+
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const text = await res.text();
+      if (text.toLowerCase().includes('invalid') || text.trim().length === 0) {
+        setStatus('Chiave non valida o nessun dato ricevuto. Verifica la MAP_KEY.', 'warn');
+        return;
+      }
+      const rows = text.trim().split('\n');
+      const header = rows[0].split(',');
+      const latIdx = header.indexOf('latitude');
+      const lonIdx = header.indexOf('longitude');
+      const dateIdx = header.indexOf('acq_date');
+      const timeIdx = header.indexOf('acq_time');
+      const confIdx = header.indexOf('confidence');
+
+      fireLayer.clearLayers();
+      let count = 0, suspectCount = 0;
+      for (let i = 1; i < rows.length; i++) {
+        const cols = rows[i].split(',');
+        if (cols.length < header.length) continue;
+        const lat = parseFloat(cols[latIdx]);
+        const lon = parseFloat(cols[lonIdx]);
+        if (isNaN(lat) || isNaN(lon)) continue;
+        const acqDate = cols[dateIdx], acqTime = cols[timeIdx] || '0000';
+        const age = hoursAgo(acqDate, acqTime);
+
+        // Stessi due filtri dello script Python: alba/tramonto e siti industriali noti
+        // (il filtro "fonte ricorrente" richiede lo storico, non disponibile qui in tempo reale)
+        const twilight = isTwilightSuspect(lat, lon, acqDate, acqTime);
+        const industrial = nearbyIndustrialSite(lat, lon);
+        const reasons = [];
+        if (twilight) reasons.push('vicino ad alba/tramonto (possibile riflesso)');
+        if (industrial) reasons.push(`vicino a sito industriale noto: ${industrial}`);
+        const isSuspect = reasons.length > 0;
+        if (isSuspect) suspectCount++;
+
+        const color = isSuspect ? '#b7b7b7' : (age <= 24 ? '#c1440e' : '#f0a45a');
+        const marker = L.circleMarker([lat, lon], {
+          radius: isSuspect ? 5 : 6, color, fillColor: color, fillOpacity: isSuspect ? 0.5 : 0.75, weight: 1
+        });
+        marker.bindPopup(
+          `<strong>Hotspot satellitare${isSuspect ? ' — sospetto' : ''}</strong><br>` +
+          `Data/ora (UTC): ${acqDate} ${acqTime}<br>` +
+          `Confidenza: ${cols[confIdx] || 'n/d'}<br>` +
+          `Coordinate: ${lat.toFixed(3)}, ${lon.toFixed(3)}` +
+          (isSuspect ? `<br><em>${reasons.join(' · ')}</em>` : '')
+        );
+        marker.addTo(fireLayer);
+        count++;
+      }
+      setStatus(count > 0
+        ? `${count} hotspot caricati (ultime 48h, satellite VIIRS) — ${suspectCount} marcati come sospetti.`
+        : 'Nessun hotspot attivo rilevato in Sardegna al momento — buon segno.', 'ok');
+      document.getElementById('lastUpdate').textContent = new Date().toLocaleString('it-IT');
+    } catch (err) {
+      setStatus('Errore nel contattare l\'API FIRMS: ' + err.message, 'warn');
+    }
+  }
+
+  document.getElementById('loadFires').addEventListener('click', loadFires);
+  if (savedKey) loadFires();
+</script>
+</body>
+</html>
