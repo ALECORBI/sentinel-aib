@@ -25,6 +25,13 @@ sospetti vengono solo marcati (is_twilight_suspect, is_recurring_source,
 near_industrial_site) così la dashboard può mostrarli in modo diverso
 invece di trattarli come un incendio vero.
 
+Inoltre, ogni hotspot viene associato al Comune sardo di appartenenza
+(point-in-polygon sui confini ISTAT in sardegna_comuni.geojson), e per ogni
+rilevamento NUOVO e NON sospetto viene inviato un alert automatico via
+Telegram e/o email (entrambi opzionali e indipendenti, vedi README per la
+configurazione dei secrets TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID e
+SMTP_USER/SMTP_PASS/ALERT_EMAIL_TO).
+
 USO:
     1. Richiedi una MAP_KEY gratuita (istantanea): https://firms.modaps.eosdis.nasa.gov/api/map_key/
     2. Esporta la chiave come variabile d'ambiente:
@@ -57,10 +64,13 @@ import io
 import json
 import math
 import os
+import smtplib
 import sqlite3
 import sys
+import urllib.error
 import urllib.request
 from datetime import date, datetime, timezone
+from email.mime.text import MIMEText
 
 # Bounding box Sardegna: west, south, east, north
 SARDINIA_BBOX = "8.05,38.80,9.90,41.35"
@@ -95,6 +105,7 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "sentinel_aib.db")
 HISTORY_JSON = os.path.join(DATA_DIR, "history.json")
 SUMMARY_JSON = os.path.join(DATA_DIR, "history_summary.json")
+COMUNI_GEOJSON = os.path.join(BASE_DIR, "sardegna_comuni.geojson")
 
 
 def fetch(map_key: str) -> str:
@@ -175,6 +186,73 @@ def nearby_industrial_site(lat: float, lon: float):
 
 
 # ---------------------------------------------------------------------------
+# Comune di appartenenza (point-in-polygon sui confini comunali ISTAT)
+# ---------------------------------------------------------------------------
+# Caricato una sola volta e riusato per tutti i punti dell'esecuzione. Se lo
+# script gira senza il file sardegna_comuni.geojson accanto (o senza shapely
+# installato) il campo "comune" resta semplicemente vuoto: non blocca il resto.
+
+_COMUNI_SHAPES = None  # lista di (nome_comune, shapely_geometry), calcolata pigra
+
+
+def _load_comuni_shapes():
+    global _COMUNI_SHAPES
+    if _COMUNI_SHAPES is not None:
+        return _COMUNI_SHAPES
+    _COMUNI_SHAPES = []
+    try:
+        from shapely.geometry import shape
+        if not os.path.exists(COMUNI_GEOJSON):
+            print(f"Attenzione: {COMUNI_GEOJSON} non trovato, il campo 'comune' resterà vuoto.")
+            return _COMUNI_SHAPES
+        with open(COMUNI_GEOJSON, encoding="utf-8") as f:
+            data = json.load(f)
+        for feat in data.get("features", []):
+            name = feat.get("properties", {}).get("comune")
+            geom = shape(feat["geometry"])
+            _COMUNI_SHAPES.append((name, geom))
+    except ImportError:
+        print("Attenzione: libreria 'shapely' non disponibile, il campo 'comune' resterà vuoto.")
+    return _COMUNI_SHAPES
+
+
+def find_comune(lat: float, lon: float, max_distance_km: float = 5.0):
+    """Trova il Comune sardo a cui appartiene il punto. Se il punto cade fuori
+    da tutti i confini (es. leggermente in mare, per l'incertezza di
+    localizzazione del satellite), restituisce il Comune più vicino entro
+    max_distance_km, preceduto da '~' per indicare che è un'approssimazione.
+    Restituisce None se non c'è nessun Comune abbastanza vicino."""
+    shapes = _load_comuni_shapes()
+    if not shapes:
+        return None
+    try:
+        from shapely.geometry import Point
+    except ImportError:
+        return None
+
+    point = Point(lon, lat)
+    for name, geom in shapes:
+        if geom.contains(point):
+            return name
+
+    # Nessun contenimento diretto: cerca il confine più vicino (in gradi,
+    # poi convertito approssimativamente in km per il confronto con la soglia)
+    best_name, best_deg = None, None
+    for name, geom in shapes:
+        d = geom.distance(point)
+        if best_deg is None or d < best_deg:
+            best_deg, best_name = d, name
+    if best_name is None:
+        return None
+    # 1 grado ~= 111 km alla latitudine sarda; approssimazione sufficiente
+    # per decidere se il Comune più vicino è "abbastanza vicino"
+    approx_km = best_deg * 111.0
+    if approx_km <= max_distance_km:
+        return f"~{best_name}"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 
@@ -192,9 +270,18 @@ def init_db(conn: sqlite3.Connection):
             source TEXT,
             fetched_at TEXT,              -- quando lo script lo ha scaricato (non l'orario dell'evento)
             is_twilight_suspect INTEGER,  -- 1 = vicino ad alba/tramonto, possibile riflesso
-            near_industrial_site TEXT     -- nome del sito industriale noto vicino, o NULL
+            near_industrial_site TEXT,    -- nome del sito industriale noto vicino, o NULL
+            comune TEXT,                  -- Comune sardo di appartenenza (o "~Nome" se approssimato), o NULL
+            alerted INTEGER DEFAULT 0     -- 1 = alert già inviato per questo hotspot (Telegram/email)
         )
     """)
+    conn.commit()
+    # Migrazione morbida: se il DB esiste già da prima di queste colonne, aggiungile.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(hotspots)")}
+    if "comune" not in existing_cols:
+        conn.execute("ALTER TABLE hotspots ADD COLUMN comune TEXT")
+    if "alerted" not in existing_cols:
+        conn.execute("ALTER TABLE hotspots ADD COLUMN alerted INTEGER DEFAULT 0")
     conn.commit()
 
 
@@ -203,6 +290,77 @@ def row_id(row: dict) -> str:
         row.get("latitude", ""), row.get("longitude", ""),
         row.get("acq_date", ""), row.get("acq_time", ""), SOURCE,
     ])
+
+
+# ---------------------------------------------------------------------------
+# Alert automatici (Telegram + email)
+# ---------------------------------------------------------------------------
+# Entrambi i canali sono opzionali e indipendenti: se le variabili d'ambiente
+# relative a un canale non sono impostate (perché il Comune/utente non ha
+# ancora configurato quel secret su GitHub), quel canale viene semplicemente
+# saltato con un messaggio informativo — lo script non si blocca mai per
+# questo. Per non spammare notifiche separate una per una, tutti gli hotspot
+# "nuovi e non sospetti" trovati in una singola esecuzione vengono raccolti
+# in UN solo messaggio/email per esecuzione (ogni 3 ore).
+
+def _format_alert_text(items: list) -> str:
+    lines = [f"🔥 Sentinel AIB — {len(items)} nuovo/i hotspot rilevato/i in Sardegna (non filtrato/i come falso allarme):", ""]
+    for h in items:
+        comune = h.get("comune") or "comune non determinato"
+        lines.append(
+            f"- {h['acq_date']} {h['acq_time']} UTC · {comune} · "
+            f"coord. {h['latitude']:.3f},{h['longitude']:.3f} · "
+            f"confidenza {h.get('confidence') or 'n/d'} · FRP {h.get('frp', 'n/d')} MW"
+        )
+    lines.append("")
+    lines.append("Dati satellitari NASA FIRMS — verifica sempre prima di allertare risorse operative.")
+    return "\n".join(lines)
+
+
+def send_telegram_alert(items: list):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("Alert Telegram non inviato: TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID non configurati (opzionale).")
+        return
+    text = _format_alert_text(items)
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+        print(f"Alert Telegram inviato ({len(items)} hotspot).")
+    except urllib.error.URLError as e:
+        print(f"Errore nell'invio dell'alert Telegram: {e}")
+
+
+def send_email_alert(items: list):
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_pass = os.environ.get("SMTP_PASS")
+    to_addr = os.environ.get("ALERT_EMAIL_TO")
+    if not smtp_user or not smtp_pass or not to_addr:
+        print("Alert email non inviato: SMTP_USER, SMTP_PASS o ALERT_EMAIL_TO non configurati (opzionale).")
+        return
+    smtp_server = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+
+    text = _format_alert_text(items)
+    msg = MIMEText(text, "plain", "utf-8")
+    msg["Subject"] = f"[Sentinel AIB] {len(items)} nuovo/i hotspot rilevato/i in Sardegna"
+    msg["From"] = smtp_user
+    msg["To"] = to_addr
+
+    try:
+        with smtplib.SMTP(smtp_server, smtp_port, timeout=20) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, [to_addr], msg.as_string())
+        print(f"Alert email inviato a {to_addr} ({len(items)} hotspot).")
+    except (smtplib.SMTPException, OSError) as e:
+        print(f"Errore nell'invio dell'alert email: {e}")
 
 
 def main():
@@ -229,6 +387,7 @@ def main():
     fetched_at = datetime.now(timezone.utc).isoformat()
     cur = conn.cursor()
     new_count = 0
+    new_row_ids = []  # id dei rilevamenti effettivamente nuovi in questa esecuzione (per gli alert)
     for row in rows:
         rid = row_id(row)
         try:
@@ -239,21 +398,33 @@ def main():
 
             twilight = is_twilight_suspect(lat, lon, acq_date, acq_time)
             industrial = nearby_industrial_site(lat, lon)
+            comune = find_comune(lat, lon)
 
             cur.execute(
                 """INSERT OR IGNORE INTO hotspots
                    (id, latitude, longitude, acq_date, acq_time, confidence, frp, satellite,
-                    source, fetched_at, is_twilight_suspect, near_industrial_site)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    source, fetched_at, is_twilight_suspect, near_industrial_site, comune)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (rid, lat, lon, acq_date, acq_time, row.get("confidence", ""),
                  float(row.get("frp", 0) or 0), row.get("satellite", ""), SOURCE, fetched_at,
-                 1 if twilight else 0, industrial)
+                 1 if twilight else 0, industrial, comune)
             )
             if cur.rowcount == 1:
                 new_count += 1
+                new_row_ids.append(rid)
         except (ValueError, TypeError):
             continue
     conn.commit()
+
+    # Backfill: righe salvate prima che esistesse il campo "comune" (o create
+    # senza sardegna_comuni.geojson disponibile) vengono completate ora.
+    missing_comune = conn.execute(
+        "SELECT id, latitude, longitude FROM hotspots WHERE comune IS NULL"
+    ).fetchall()
+    if missing_comune:
+        for rid, lat, lon in missing_comune:
+            conn.execute("UPDATE hotspots SET comune=? WHERE id=?", (find_comune(lat, lon), rid))
+        conn.commit()
 
     # --- Filtro 2b: fonti fisse ricorrenti, calcolato sull'intero storico ---
     # Raggruppa per griglia (lat/lon arrotondati) e conta i giorni distinti in cui
@@ -266,26 +437,46 @@ def main():
 
     # Esporta l'intero storico in JSON (letto dalla dashboard), con tutti i flag
     all_rows = conn.execute(
-        "SELECT latitude, longitude, acq_date, acq_time, confidence, frp, satellite, "
-        "is_twilight_suspect, near_industrial_site FROM hotspots ORDER BY acq_date, acq_time"
+        "SELECT id, latitude, longitude, acq_date, acq_time, confidence, frp, satellite, "
+        "is_twilight_suspect, near_industrial_site, comune FROM hotspots ORDER BY acq_date, acq_time"
     ).fetchall()
 
     history = []
+    alert_candidates = []       # nuovi in questa esecuzione E non sospetti: quelli da notificare
+    alert_candidate_ids = []    # id corrispondenti, per marcare "alerted" solo su questi
     for r in all_rows:
-        lat, lon = r[0], r[1]
+        rid, lat, lon = r[0], r[1], r[2]
         key = (round(lat, RECURRING_GRID_DECIMALS), round(lon, RECURRING_GRID_DECIMALS))
         is_recurring = key in recurring_keys
-        history.append({
-            "latitude": lat, "longitude": lon, "acq_date": r[2], "acq_time": r[3],
-            "confidence": r[4], "frp": r[5], "satellite": r[6],
-            "is_twilight_suspect": bool(r[7]),
-            "near_industrial_site": r[8],
+        is_suspect = bool(r[8]) or is_recurring or bool(r[9])
+        entry = {
+            "latitude": lat, "longitude": lon, "acq_date": r[3], "acq_time": r[4],
+            "confidence": r[5], "frp": r[6], "satellite": r[7],
+            "is_twilight_suspect": bool(r[8]),
+            "near_industrial_site": r[9],
             "is_recurring_source": is_recurring,
             "recurring_days_count": len(recurring_cells.get(key, [])),
-        })
+            "comune": r[10],
+        }
+        history.append(entry)
+        if rid in new_row_ids and not is_suspect:
+            alert_candidates.append(entry)
+            alert_candidate_ids.append(rid)
 
     with open(HISTORY_JSON, "w", encoding="utf-8") as f:
         json.dump({"generated_at": fetched_at, "count": len(history), "hotspots": history}, f, ensure_ascii=False)
+
+    # --- Alert automatici: solo per i rilevamenti nuovi in questa esecuzione
+    # e non marcati come sospetti da nessuno dei filtri. Un solo messaggio/email
+    # per esecuzione (ogni 3 ore), anche se ci sono più hotspot nuovi insieme.
+    if alert_candidates:
+        print(f"{len(alert_candidates)} nuovo/i hotspot non sospetto/i: invio alert...")
+        send_telegram_alert(alert_candidates)
+        send_email_alert(alert_candidates)
+        conn.executemany("UPDATE hotspots SET alerted=1 WHERE id=?", [(rid,) for rid in alert_candidate_ids])
+        conn.commit()
+    else:
+        print("Nessun nuovo hotspot non sospetto in questa esecuzione: nessun alert da inviare.")
 
     # Conteggi aggregati per giorno, distinguendo probabili reali da sospetti
     per_day_total, per_day_suspect = {}, {}
